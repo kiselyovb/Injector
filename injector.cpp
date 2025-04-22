@@ -1,5 +1,8 @@
 ﻿#include "pch.h"
 // injector.cpp — Инжектор DLL с логированием, отчётом в JSON (UTF-8), с указанием процессов и времени
+#define _CRT_SECURE_NO_WARNINGS
+#define _SILENCE_CXX17_CODECVT_HEADER_DEPRECATION_WARNING
+
 #include <windows.h>
 #include <tlhelp32.h>
 #include <tchar.h>
@@ -22,7 +25,7 @@ struct InjectResult {
     std::wstring processName;
 };
 
-void LogEvent(LogLevel level, const wchar_t* message) {
+static void LogEvent(LogLevel level, const wchar_t* message) {
     WORD type = (level == LOG_ERROR) ? EVENTLOG_ERROR_TYPE : EVENTLOG_INFORMATION_TYPE;
     HANDLE hEventLog = RegisterEventSourceW(NULL, L"DragBlockInjector");
     if (hEventLog) {
@@ -32,7 +35,7 @@ void LogEvent(LogLevel level, const wchar_t* message) {
     }
 }
 
-bool IsGuiProcess(DWORD pid) {
+static bool IsGuiProcess(DWORD pid) {
     HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
     if (!hProcess) return false;
     HMODULE hMods[1024]; DWORD cbNeeded;
@@ -51,7 +54,7 @@ bool IsGuiProcess(DWORD pid) {
     return found;
 }
 
-std::wstring GetProcessName(DWORD pid) {
+static std::wstring GetProcessName(DWORD pid) {
     std::wstring result = L"<unknown>";
     HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
     if (hProcess) {
@@ -64,7 +67,7 @@ std::wstring GetProcessName(DWORD pid) {
     return result;
 }
 
-bool InjectDLL(DWORD pid, const std::wstring& dllPath) {
+static bool InjectDLL(DWORD pid, const std::wstring& dllPath) {
     HANDLE hProcess = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
     if (!hProcess) return false;
 
@@ -76,7 +79,10 @@ bool InjectDLL(DWORD pid, const std::wstring& dllPath) {
     }
 
     HMODULE hKernel32 = GetModuleHandleW(L"Kernel32");
+    if (!hKernel32) { VirtualFreeEx(hProcess, allocMem, 0, MEM_RELEASE); CloseHandle(hProcess); return false; }
+
     FARPROC loadLib = GetProcAddress(hKernel32, "LoadLibraryW");
+    if (!loadLib) { VirtualFreeEx(hProcess, allocMem, 0, MEM_RELEASE); CloseHandle(hProcess); return false; }
 
     HANDLE hThread = CreateRemoteThread(hProcess, NULL, 0, (LPTHREAD_START_ROUTINE)loadLib, allocMem, 0, NULL);
     if (!hThread) {
@@ -89,14 +95,14 @@ bool InjectDLL(DWORD pid, const std::wstring& dllPath) {
     return true;
 }
 
-std::vector<DWORD> FindMatchingProcesses(const std::wstring& nameFragment, bool guiOnly, bool injectAllMode) {
+static std::vector<DWORD> FindMatchingProcesses(const std::wstring& nameFragment, bool guiOnly) {
     std::vector<DWORD> pids;
     PROCESSENTRY32W entry; entry.dwSize = sizeof(PROCESSENTRY32W);
     HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (Process32FirstW(snapshot, &entry)) {
         do {
             std::wstring exe(entry.szExeFile);
-            if (injectAllMode || exe.find(nameFragment) != std::wstring::npos) {
+            if (exe.find(nameFragment) != std::wstring::npos) {
                 if (!guiOnly || IsGuiProcess(entry.th32ProcessID)) {
                     pids.push_back(entry.th32ProcessID);
                 }
@@ -107,87 +113,65 @@ std::vector<DWORD> FindMatchingProcesses(const std::wstring& nameFragment, bool 
     return pids;
 }
 
-std::string GetCurrentTimestamp() {
+static std::string GetCurrentTimestamp() {
     std::time_t now = std::time(nullptr);
     char buf[64];
-    std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", std::localtime(&now));
+    std::tm localTime;
+    localtime_s(&localTime, &now);
+    std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &localTime);
     return buf;
 }
 
-int wmain(int argc, wchar_t* argv[]) {
-    if (argc < 2) {
+static int wmain(int argc, wchar_t* argv[]) {
+    if (argc < 3) {
         std::wcout << L"Usage:\n"
-            L"  injector.exe <name_fragment> <path_to_dll>                - inject into first matching process\n"
-            L"  injector.exe /all <name_fragment> <path_to_dll> [/gui]   - inject into all matching processes\n"
-            L"  injector.exe /all <path_to_dll> [/gui]                   - inject into all processes (optionally GUI-only)\n"
-            L"\nOptions:\n"
-            L"  /all   — inject into multiple processes\n"
-            L"  /gui   — limit to GUI applications only (those with user32.dll loaded)\n";
+            L"  injector.exe <name_fragment> <path_to_dll>               (first match)\n"
+            L"  injector.exe /all <name_fragment> <path_to_dll> [/gui]  (all matches, optionally GUI-only)\n";
         return 1;
     }
 
-    std::wstring nameFragment, dllPath;
-    bool injectAll = false, guiOnly = false, injectEverything = false;
-    int index = 1;
-    if (std::wstring(argv[index]) == L"/all") { injectAll = true; index++; }
+    std::wstring nameFragment;
+    std::wstring dllPath;
+    bool injectAll = false;
+    bool guiOnly = false;
 
-    if (argc <= index) {
+    int index = 1;
+    if (std::wstring(argv[index]) == L"/all") {
+        injectAll = true;
+        index++;
+    }
+
+    if (argc <= index + 1) {
         std::wcerr << L"Invalid arguments.\n";
         return 1;
     }
 
-    if (injectAll && (argc - index == 1 || (argc - index == 2 && std::wstring(argv[argc - 1]) == L"/gui"))) {
-        dllPath = argv[index];
-        if (argc > index + 1 && std::wstring(argv[index + 1]) == L"/gui") guiOnly = true;
-        injectEverything = true;
-    }
-    else {
-        nameFragment = argv[index];
-        dllPath = argv[index + 1];
-        if (argc > index + 2 && std::wstring(argv[index + 2]) == L"/gui") guiOnly = true;
+    nameFragment = argv[index];
+    dllPath = argv[index + 1];
+
+    if (argc > index + 2 && std::wstring(argv[index + 2]) == L"/gui") {
+        guiOnly = true;
     }
 
-    std::vector<DWORD> pids = FindMatchingProcesses(nameFragment, guiOnly, injectEverything);
+    std::vector<DWORD> pids = FindMatchingProcesses(nameFragment, guiOnly);
     if (pids.empty()) {
-        std::wcerr << L"No matching processes found." << std::endl;
+        std::wcerr << L"No matching processes found: " << nameFragment << std::endl;
         LogEvent(LOG_ERROR, L"Target process(es) not found");
         return 1;
     }
 
-    std::vector<InjectResult> successList, failList;
+    bool anySuccess = false;
     for (DWORD pid : pids) {
-        std::wstring pname = GetProcessName(pid);
-        std::wcout << L"Injecting into [" << pid << L"] " << pname << L"... ";
+        std::wcout << L"Injecting into PID: " << pid << L"... ";
         if (InjectDLL(pid, dllPath)) {
             std::wcout << L"[OK]\n";
-            successList.push_back({ pid, pname });
+            anySuccess = true;
         }
         else {
             std::wcout << L"[FAIL]\n";
-            failList.push_back({ pid, pname });
         }
         if (!injectAll) break;
     }
 
-    std::ofstream outJson("injector.json", std::ios::out | std::ios::binary);
-    outJson << "{\n";
-    outJson << "  \"timestamp\": \"" << GetCurrentTimestamp() << "\",\n";
-    outJson << "  \"dll\": \"" << std::wstring_convert<std::codecvt_utf8<wchar_t>>().to_bytes(dllPath) << "\",\n";
-    outJson << "  \"guiOnly\": " << (guiOnly ? "true" : "false") << ",\n";
-    outJson << "  \"success\": [\n";
-    for (size_t i = 0; i < successList.size(); ++i) {
-        outJson << "    { \"pid\": " << successList[i].pid << ", \"name\": \"" << std::wstring_convert<std::codecvt_utf8<wchar_t>>().to_bytes(successList[i].processName) << "\" }";
-        if (i + 1 < successList.size()) outJson << ",";
-        outJson << "\n";
-    }
-    outJson << "  ],\n  \"failed\": [\n";
-    for (size_t i = 0; i < failList.size(); ++i) {
-        outJson << "    { \"pid\": " << failList[i].pid << ", \"name\": \"" << std::wstring_convert<std::codecvt_utf8<wchar_t>>().to_bytes(failList[i].processName) << "\" }";
-        if (i + 1 < failList.size()) outJson << ",";
-        outJson << "\n";
-    }
-    outJson << "  ]\n}";
-    outJson.close();
-
-    return !successList.empty() ? 0 : 1;
+    return anySuccess ? 0 : 1;
 }
