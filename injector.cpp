@@ -67,6 +67,33 @@ static std::wstring GetProcessName(DWORD pid) {
     return result;
 }
 
+static bool IsDllAlreadyInjected(DWORD pid, const std::wstring& dllName) {
+    HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
+    if (!hProcess) return false;
+
+    HMODULE hMods[1024];
+    DWORD cbNeeded;
+    bool found = false;
+
+    if (EnumProcessModules(hProcess, hMods, sizeof(hMods), &cbNeeded)) {
+        for (unsigned int i = 0; i < (cbNeeded / sizeof(HMODULE)); ++i) {
+            wchar_t szModName[MAX_PATH];
+            if (GetModuleFileNameExW(hProcess, hMods[i], szModName, MAX_PATH)) {
+                std::wstring mod = szModName;
+                size_t pos = mod.find_last_of(L"\\/");
+                if (pos != std::wstring::npos) mod = mod.substr(pos + 1);
+                if (_wcsicmp(mod.c_str(), dllName.c_str()) == 0) {
+                    found = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    CloseHandle(hProcess);
+    return found;
+}
+
 static bool InjectDLL(DWORD pid, const std::wstring& dllPath) {
     HANDLE hProcess = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
     if (!hProcess) return false;
@@ -162,7 +189,16 @@ static int wmain(int argc, wchar_t* argv[]) {
 
     bool anySuccess = false;
     for (DWORD pid : pids) {
-        std::wcout << L"Injecting into PID: " << pid << L"... ";
+        std::wstring processName = GetProcessName(pid);
+        std::wstring dllFileName = dllPath.substr(dllPath.find_last_of(L"\\") + 1);
+
+        if (IsDllAlreadyInjected(pid, dllFileName)) {
+            std::wcout << L"Skipping PID " << pid << L" (" << processName << L") — already injected.\n";
+            LogEvent(LOG_INFO, (L"Process already injected: " + std::to_wstring(pid)).c_str());
+            continue;
+        }
+
+        std::wcout << L"Injecting into PID: " << pid << L" (" << processName << L")... ";
         if (InjectDLL(pid, dllPath)) {
             std::wcout << L"[OK]\n";
             anySuccess = true;
@@ -170,6 +206,7 @@ static int wmain(int argc, wchar_t* argv[]) {
         else {
             std::wcout << L"[FAIL]\n";
         }
+
         if (!injectAll) break;
     }
 
